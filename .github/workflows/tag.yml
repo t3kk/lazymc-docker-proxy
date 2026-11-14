@@ -33,32 +33,11 @@ jobs:
 
     permissions:
       contents: write
-      pull-requests: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          ref: master
-
-      - name: Update changelog
-        id: update_changelog
-        uses: thomaseizinger/keep-a-changelog-new-release@3.1.0
-        with:
-          tag: ${{ github.ref_name }}
-
-      - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.update_changelog.outputs.release-notes }}
-          draft: false
-          prerelease: false
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v7
-        with:
-          title: Release ${{ github.ref_name }}
-          branch: release/${{ github.ref_name }}
-          labels: release
-          commit-message: "[ci skip] update changelog for ${{ github.ref_name }}"
-          body: This PR was created by the release workflow.
+      - name: Create release with generated notes
+        run: gh release create "$TAG" --verify-tag --generate-notes
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

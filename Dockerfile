@@ -1,9 +1,8 @@
-# setup lazymc versions
+# version of the lazymc source in ./lazymc, written to generated configs
 ARG LAZYMC_VERSION=0.2.11
-ARG LAZYMC_LEGACY_VERSION=0.2.10
 
 # set up rust
-FROM --platform=$BUILDPLATFORM rust:1.92-slim AS rust-setup
+FROM --platform=$BUILDPLATFORM rust:1.100-slim AS rust-setup
 ARG TARGETARCH
 RUN <<EOF
   echo Running build for $TARGETARCH
@@ -21,21 +20,10 @@ RUN apt update && apt install -y musl-tools musl-dev git
 RUN update-ca-certificates
 RUN apt-get update && apt-get install -y pkg-config libssl-dev crossbuild-essential-arm64 crossbuild-essential-armhf
 
-# build lazymc
+# build lazymc from the bundled source, which includes the transfer join method
 FROM --platform=$BUILDPLATFORM rust-setup AS lazymc-builder
 WORKDIR /usr/src/lazymc
-ARG LAZYMC_VERSION
-ENV LAZYMC_VERSION=$LAZYMC_VERSION
-RUN git clone --branch v$LAZYMC_VERSION https://github.com/timvisee/lazymc .
-RUN cargo build --target "$(cat /rust-arch)" --release --locked
-RUN mv /usr/src/lazymc/target/"$(cat /rust-arch)" /usr/src/lazymc/target/output_final
-
-# build lazymc-legacy
-FROM --platform=$BUILDPLATFORM rust-setup AS lazymc-legacy-builder
-WORKDIR /usr/src/lazymc
-ARG LAZYMC_LEGACY_VERSION
-ENV LAZYMC_LEGACY_VERSION=$LAZYMC_LEGACY_VERSION
-RUN git clone --branch v$LAZYMC_LEGACY_VERSION https://github.com/timvisee/lazymc .
+COPY lazymc ./
 RUN cargo build --target "$(cat /rust-arch)" --release --locked
 RUN mv /usr/src/lazymc/target/"$(cat /rust-arch)" /usr/src/lazymc/target/output_final
 
@@ -57,14 +45,9 @@ FROM scratch
 # setup lazymc version
 ARG LAZYMC_VERSION
 ENV LAZYMC_VERSION=$LAZYMC_VERSION
-ARG LAZYMC_LEGACY_VERSION
-ENV LAZYMC_LEGACY_VERSION=$LAZYMC_LEGACY_VERSION
 
 # Copy the compiled binary from the lazymc-builder stage
 COPY --from=lazymc-builder /usr/src/lazymc/target/output_final/release/lazymc /usr/local/bin/lazymc
-
-# Copy the compiled binary from the lazymc-legacy-builder stage
-COPY --from=lazymc-legacy-builder /usr/src/lazymc/target/output_final/release/lazymc /usr/local/bin/lazymc-legacy
 
 # Copy the compiled binary from the lazymc-docker-proxy stage
 COPY --from=app-builder /usr/src/lazymc-docker-proxy/target/output_final/release/lazymc-docker-proxy /usr/local/bin/lazymc-docker-proxy

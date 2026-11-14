@@ -2,6 +2,15 @@
 
 start_timestamp=""
 
+# These tests download and boot real Minecraft servers, which occasionally
+# fails for reasons outside of this project. Retry a failed test once, and
+# abort an attempt that takes longer than 20 minutes. The workflow caps the
+# whole job at 45 minutes.
+# bats resets these for each test file, so they must be set here and not in
+# the environment.
+BATS_TEST_RETRIES=1
+BATS_TEST_TIMEOUT=1200
+
 # set up start timestamp
 reset_timestamp() {
     start_timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

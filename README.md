@@ -12,7 +12,14 @@ This project combines:
 Important notes:
 - `lazymc` requires static IP addresses for managed server containers.
 - For modern Minecraft versions (26.x), use `itzg/minecraft-server:java25`.
-- The recommended proxy image is `ghcr.io/joesturge/lazymc-docker-proxy:latest`.
+- This image is published as `ghcr.io/t3kk/lazymc-docker-proxy:latest`.
+- Minecraft servers older than 1.20.3 are not supported by this fork.
+
+> This is a fork of [joesturge/lazymc-docker-proxy](https://github.com/joesturge/lazymc-docker-proxy).
+> It builds `lazymc` from the bundled [`lazymc/`](./lazymc) directory, which is
+> [timvisee/lazymc](https://github.com/timvisee/lazymc) plus the `transfer` join method and `{last_online}` MOTD
+> placeholder from [ToxesFoxes/lazymc](https://github.com/ToxesFoxes/lazymc), with fixes for use in Docker.
+> See [Transfer join method](#transfer-join-method-recommended-for-slow-starting-and-modded-servers).
 
 ![example](images/example.png)
 
@@ -50,7 +57,7 @@ networks:
 
 services:
   lazymc:
-    image: ghcr.io/joesturge/lazymc-docker-proxy:latest
+    image: ghcr.io/t3kk/lazymc-docker-proxy:latest
     # the IPs should start at .2 as .1 is reserved for the gateway
     networks:
       minecraft-network:
@@ -134,7 +141,7 @@ services:
       - "25565:25565"
 
   lazymc:
-    image: ghcr.io/joesturge/lazymc-docker-proxy:latest
+    image: ghcr.io/t3kk/lazymc-docker-proxy:latest
     # Assign a static IP to the lazymc container
     networks:
       minecraft-network:
@@ -214,19 +221,28 @@ volumes:
   data-secondary:
 ```
 
-### Forge 1.19.2
+### Transfer join method (recommended for slow-starting and modded servers)
+
+This fork bundles a build of `lazymc` that includes the `transfer` join method.
+A joining client is held in the configuration state with keep alive packets while the server starts,
+then told to reconnect once it is ready. Unlike `hold`, this is not limited by the 30 second client timeout,
+and unlike `lobby` it works with modded servers. The player joins with a single connection attempt.
+
+Requirements:
+- The client must use Minecraft 1.20.5 or above. Older clients fall through to the next join method, so keep `kick` after `transfer`.
+- The Minecraft server must accept transfers: `accepts-transfers=true` in `server.properties`.
 
 ```yaml
 networks:
   minecraft-network:
-    driver: bridge    
+    driver: bridge
     ipam:
       config:
         - subnet: 172.18.0.0/16
 
 services:
   lazymc:
-    image: ghcr.io/joesturge/lazymc-docker-proxy:latest
+    image: ghcr.io/t3kk/lazymc-docker-proxy:latest
     networks:
       minecraft-network:
         ipv4_address: 172.18.0.2
@@ -246,26 +262,27 @@ services:
       - lazymc.enabled=true
       - lazymc.group=mc
       - lazymc.server.address=mc:25565
-      # The minecraft client version of the forge server
-      - lazymc.public.version=1.19.2
-      # The minecraft protocol version of the forge server
-      - lazymc.public.protocol=760
-      # Set to true on a forge server
-      - lazymc.server.forge=true
+      # Hold and transfer modern clients, kick clients that are too old
+      - lazymc.join.methods=transfer,kick
+      # Give a slow server up to 10 minutes to start
+      - lazymc.join.transfer.timeout=600
     tty: true
     stdin_open: true
     restart: no
     environment:
       EULA: "TRUE"
-      TYPE: FORGE
-      # The minecraft client version
-      VERSION: "1.19.2"
+      # Sets accepts-transfers=true in server.properties
+      CUSTOM_SERVER_PROPERTIES: |
+        accepts-transfers=true
     volumes:
       - data:/data
 
 volumes:
   data:
 ```
+
+By default the client is sent back to the host and port it originally connected to, so this works unchanged behind
+port mappings and custom domains. Set `lazymc.join.transfer.address` only if clients must reconnect somewhere else.
 
 ### Configuration using labels
 
@@ -289,6 +306,9 @@ which will be picked up by `lazymc-docker-proxy` (\* is required):
 - **lazymc.join.lobby.timeout** - Maximum time in seconds in the lobby while the server starts.
 - **lazymc.join.lobby.message** - Message banner in lobby shown to client.
 - **lazymc.join.lobby.ready_sound** - Sound effect to play when server is ready.
+- **lazymc.join.transfer.timeout** - Maximum time in seconds to hold the client while the server starts. Defaults to `600`.
+- **lazymc.join.transfer.keep_alive_interval** - Interval in seconds between keep alive packets sent to the held client. Defaults to `10`.
+- **lazymc.join.transfer.address** - Address the client is told to reconnect to, such as `example.com:25565`. Defaults to the address the client used to connect.
 - **lazymc.lockout.enabled** - Enable to prevent everybody from connecting through lazymc. Instantly kicks player.
 - **lazymc.lockout.message** - Kick players with following message.
 - **lazymc.motd.sleeping** - MOTD, shown in the server browser when sleeping.
