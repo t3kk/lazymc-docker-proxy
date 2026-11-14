@@ -52,8 +52,8 @@ timeout = 600
 # Interval between keep alive packets.
 keep_alive_interval = 10
 
-# Where the client should reconnect to. Defaults to the public address lazymc
-# listens on, which is usually what you want.
+# Where the client should reconnect to. Defaults to the address the client used
+# to reach lazymc, which is usually what you want.
 #address = "example.com:25565"
 ```
 
@@ -63,8 +63,12 @@ get a readable message.
 ## Notes
 
 The address the client is sent to must be reachable by the client, not by lazymc.
-The default is the public address lazymc listens on, so the client reconnects
-through lazymc and is proxied to the server as usual.
+By default lazymc sends the client back to the host and port it connected to in
+the first place, as reported in its handshake. The client then reconnects
+through lazymc and is proxied to the server as usual. This keeps working when
+lazymc listens on a wildcard address such as `0.0.0.0`, runs in a container, or
+sits behind a port mapping. Set `address` only if clients must reconnect
+somewhere else.
 
 While held, the client shows its regular connecting screen. Use the `[motd]`
 section to tell players the server is sleeping before they connect.

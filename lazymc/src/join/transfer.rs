@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,16 @@ use super::MethodResult;
 
 /// Minimum protocol version that supports the transfer packet (1.20.5).
 const MIN_PROTOCOL_TRANSFER: u32 = 766;
+
+/// First protocol version (1.21.2) in which the login success packet no longer
+/// has the trailing strict error handling flag.
+const PROTOCOL_NO_STRICT_ERROR_HANDLING: u32 = 768;
+
+/// Default Minecraft port, used when a configured address has no port.
+const DEFAULT_PORT: u16 = 25565;
+
+/// Time the client gets to acknowledge the login.
+const LOGIN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Clientbound login success packet ID, login state.
 const PACKET_LOGIN_SUCCESS: u8 = 0x02;
@@ -72,26 +83,40 @@ pub async fn occupy(
         }
     };
 
+    // Decide where to send the client before we commit to this method
+    let (host, port) = transfer_target(
+        config.join.transfer.address.as_deref(),
+        client_info
+            .handshake
+            .as_ref()
+            .map(|h| (h.server_addr.as_str(), h.server_port)),
+        config.public.address,
+    );
+
     let (mut reader, mut writer) = inbound.split();
 
     // Send login success, moving the client towards the configuration state
-    let payload = encode_login_success(&username)?;
+    let payload = encode_login_success(&username, protocol)?;
     let packet = RawPacket::new(PACKET_LOGIN_SUCCESS, payload).encode_with_len(client)?;
     writer.write_all(&packet).await.map_err(|_| ())?;
     trace!(target: "lazymc", "Sent login success to client");
 
     // Await login acknowledged, client enters the configuration state
     let mut buf = BytesMut::new();
-    loop {
-        let (packet, _raw) = match packet::read_packet(client, &mut buf, &mut reader).await {
-            Ok(Some(packet)) => packet,
-            Ok(None) => return Ok(MethodResult::Consumed),
-            Err(_) => return Ok(MethodResult::Consumed),
-        };
-
-        if packet.id == PACKET_LOGIN_ACKNOWLEDGED {
-            break;
+    let acknowledged = time::timeout(LOGIN_ACK_TIMEOUT, async {
+        loop {
+            match packet::read_packet(client, &mut buf, &mut reader).await {
+                Ok(Some((packet, _raw))) if packet.id == PACKET_LOGIN_ACKNOWLEDGED => break true,
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break false,
+            }
         }
+    })
+    .await
+    .unwrap_or(false);
+    if !acknowledged {
+        debug!(target: "lazymc", "Client did not acknowledge login, disconnecting");
+        return Ok(MethodResult::Consumed);
     }
 
     client.set_state(ClientState::Configuration);
@@ -122,14 +147,23 @@ pub async fn occupy(
         }
     };
 
+    // Discard anything the client sends (client information, brand, keep alive
+    // responses), this also notices a disconnecting client right away
+    let task_drain = async {
+        while let Ok(Some(_)) = packet::read_packet(client, &mut buf, &mut reader).await {}
+    };
+
     let task_wait = async {
         let mut state = server.state_receiver();
         loop {
-            state.changed().await.unwrap();
-            match state.borrow().deref() {
-                State::Starting => continue,
+            // Check current state first, server may have started in the meantime
+            match state.borrow_and_update().deref() {
+                State::Starting => {}
                 State::Started => break true,
                 State::Stopping | State::Stopped => break false,
+            }
+            if state.changed().await.is_err() {
+                break false;
             }
         }
     };
@@ -146,6 +180,10 @@ pub async fn occupy(
             trace!(target: "lazymc", "Keep alive loop ended, client probably disconnected");
             return Ok(MethodResult::Consumed);
         }
+        _ = task_drain => {
+            debug!(target: "lazymc", "Held client disconnected before server was ready");
+            return Ok(MethodResult::Consumed);
+        }
     };
 
     if !ready {
@@ -153,7 +191,6 @@ pub async fn occupy(
     }
 
     // Server is ready, transfer the client to it
-    let (host, port) = transfer_target(&config);
     info!(target: "lazymc", "Server ready, transferring client to {}:{}", host, port);
 
     let mut payload = encode_string(&host)?;
@@ -170,32 +207,84 @@ pub async fn occupy(
 
 /// Address the client should be transferred to.
 ///
-/// This must be reachable by the client, so it defaults to the public address
-/// lazymc listens on rather than the internal server address.
-fn transfer_target(config: &Config) -> (String, u16) {
-    if let Some(address) = &config.join.transfer.address {
-        if let Some((host, port)) = address.rsplit_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
+/// This must be reachable by the client. In order of preference:
+///
+/// 1. the configured address,
+/// 2. the address the client itself used to reach lazymc, from its handshake,
+/// 3. the public address lazymc listens on.
+///
+/// The handshake address is preferred over the public address, because the
+/// latter is often a wildcard such as `0.0.0.0`, or an address internal to a
+/// container, neither of which a client can connect to.
+fn transfer_target(
+    configured: Option<&str>,
+    handshake: Option<(&str, u16)>,
+    public: SocketAddr,
+) -> (String, u16) {
+    if let Some(address) = configured.map(str::trim).filter(|a| !a.is_empty()) {
+        return parse_address(address);
+    }
+
+    if let Some((addr, port)) = handshake {
+        // Forge and proxies append extra data to the host after a null byte, and
+        // hosts resolved through SRV records may have a trailing dot
+        let host = addr
+            .split('\0')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.');
+        if !host.is_empty() && port != 0 {
+            return (host.to_string(), port);
+        }
+    }
+
+    if public.ip().is_unspecified() {
+        warn!(
+            target: "lazymc",
+            "Could not determine address to transfer client to, falling back to {}, set join.transfer.address",
+            public,
+        );
+    }
+    (public.ip().to_string(), public.port())
+}
+
+/// Parse a `host`, `host:port` or `[ipv6]:port` address.
+fn parse_address(address: &str) -> (String, u16) {
+    // Bracketed IPv6, optionally with port
+    if let Some(rest) = address.strip_prefix('[') {
+        if let Some((host, port)) = rest.split_once(']') {
+            let port = port
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(DEFAULT_PORT);
+            return (host.to_string(), port);
+        }
+    }
+
+    // Host with port, a bare IPv6 address has multiple colons and no port
+    if let Some((host, port)) = address.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port.parse() {
                 return (host.to_string(), port);
             }
         }
-        return (address.clone(), config.public.address.port());
     }
 
-    (
-        config.public.address.ip().to_string(),
-        config.public.address.port(),
-    )
+    (address.to_string(), DEFAULT_PORT)
 }
 
-/// Encode a login success packet body for 1.20.5 and above.
+/// Encode a login success packet body for the given protocol version.
 ///
-/// Layout: UUID, username, property count, strict error handling flag.
-fn encode_login_success(username: &str) -> Result<Vec<u8>, ()> {
+/// Layout: UUID, username, property count, and for protocol versions before
+/// 1.21.2 a strict error handling flag.
+fn encode_login_success(username: &str, protocol: u32) -> Result<Vec<u8>, ()> {
     let mut data = uuid::offline_player_uuid(username).as_bytes().to_vec();
     data.append(&mut encode_string(username)?);
     data.append(&mut types::encode_var_int(0)?);
-    data.push(0x00);
+    if protocol < PROTOCOL_NO_STRICT_ERROR_HANDLING {
+        data.push(0x00);
+    }
     Ok(data)
 }
 
@@ -205,4 +294,79 @@ fn encode_string(value: &str) -> Result<Vec<u8>, ()> {
     let mut data = types::encode_var_int(bytes.len() as i32)?;
     data.extend_from_slice(bytes);
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public(addr: &str) -> SocketAddr {
+        addr.parse().unwrap()
+    }
+
+    #[test]
+    fn target_prefers_configured_address() {
+        let target = transfer_target(
+            Some("mc.example.com:25570"),
+            Some(("other.example.com", 25565)),
+            public("0.0.0.0:25565"),
+        );
+        assert_eq!(target, ("mc.example.com".to_string(), 25570));
+    }
+
+    #[test]
+    fn target_uses_handshake_address() {
+        let target = transfer_target(
+            None,
+            Some(("play.example.com", 25566)),
+            public("0.0.0.0:25565"),
+        );
+        assert_eq!(target, ("play.example.com".to_string(), 25566));
+    }
+
+    #[test]
+    fn target_strips_handshake_extras() {
+        let target = transfer_target(
+            None,
+            Some(("play.example.com.\0FML3\0", 25565)),
+            public("0.0.0.0:25565"),
+        );
+        assert_eq!(target, ("play.example.com".to_string(), 25565));
+    }
+
+    #[test]
+    fn target_falls_back_to_public_address() {
+        let target = transfer_target(None, Some(("", 25565)), public("192.168.1.5:25577"));
+        assert_eq!(target, ("192.168.1.5".to_string(), 25577));
+
+        let target = transfer_target(Some("  "), None, public("192.168.1.5:25577"));
+        assert_eq!(target, ("192.168.1.5".to_string(), 25577));
+    }
+
+    #[test]
+    fn parses_addresses() {
+        assert_eq!(parse_address("example.com"), ("example.com".into(), 25565));
+        assert_eq!(
+            parse_address("example.com:1234"),
+            ("example.com".into(), 1234)
+        );
+        assert_eq!(parse_address("10.0.0.1:1234"), ("10.0.0.1".into(), 1234));
+        assert_eq!(parse_address("[::1]:1234"), ("::1".into(), 1234));
+        assert_eq!(parse_address("[::1]"), ("::1".into(), 25565));
+        assert_eq!(parse_address("fe80::1"), ("fe80::1".into(), 25565));
+    }
+
+    #[test]
+    fn login_success_layout_depends_on_protocol() {
+        // 16 byte UUID, 1 byte length + 5 byte name, 1 byte property count
+        let new = encode_login_success("Steve", 768).unwrap();
+        assert_eq!(new.len(), 16 + 6 + 1);
+        assert_eq!(&new[16..22], b"\x05Steve");
+
+        // Trailing strict error handling flag before 1.21.2
+        let old = encode_login_success("Steve", 767).unwrap();
+        assert_eq!(old.len(), new.len() + 1);
+        assert_eq!(old[..new.len()], new[..]);
+        assert_eq!(old.last(), Some(&0x00));
+    }
 }

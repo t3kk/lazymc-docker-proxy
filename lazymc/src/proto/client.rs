@@ -97,7 +97,8 @@ impl ClientState {
             0 => Some(Self::Handshake),
             1 => Some(Self::Status),
             2 => Some(Self::Login),
-            3 => Some(Self::Configuration),
+            // Transfer intent (1.20.5+), a client transferred here logs in as usual
+            3 => Some(Self::Login),
             _ => None,
         }
     }
@@ -108,7 +109,7 @@ impl ClientState {
             Self::Handshake => 0,
             Self::Status => 1,
             Self::Login => 2,
-            Self::Configuration => 3,
+            Self::Configuration => -1,
             Self::Play => -1,
         }
     }
