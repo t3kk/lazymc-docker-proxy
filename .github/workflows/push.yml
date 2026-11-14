@@ -5,23 +5,27 @@ on:
       - master
       - main
   pull_request:
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request or branch supersedes a running test
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   find-tests:
     name: Find Tests
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-
     outputs:
       folders: ${{ steps.jobs.outputs.folders }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - id: jobs
         name: List test folders
@@ -39,13 +43,14 @@ jobs:
     name: Run Bats Tests
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-
     steps:
       - name: Setup BATS
         uses: bats-core/bats-action@3566550e0f594451ac0f58fcbfdeca93aa29a45e # 4.1.0
+        # The token is only used to download bats without hitting API rate limits
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          bats-version: 1.14.0
           support-install: false
           assert-install: false
           detik-install: false
@@ -53,10 +58,12 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Retries and the per test timeout are set in tests/bats/util.bash
       - name: Run tests
-        timeout-minutes: 150
+        timeout-minutes: 45
         run: bats "./tests/bats/$TEST_FOLDER"
         env:
           TEST_FOLDER: ${{ matrix.inputs }}
