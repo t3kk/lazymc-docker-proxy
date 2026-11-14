@@ -1,0 +1,65 @@
+version: '3.7'
+
+networks:
+  minecraft-network:
+    driver: bridge    
+    ipam:
+      config:
+        - subnet: 172.24.0.0/16
+
+services:
+  lazymc-transfer:
+    container_name: lazymc-transfer
+    networks:
+      minecraft-network:
+        ipv4_address: 172.24.0.2
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "debug"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - data:/server:ro
+    ports:
+      - "25565:25565"
+    build: ../../../
+
+  mc-transfer:
+    image: itzg/minecraft-server:java25
+    container_name: mc-transfer
+    networks:
+      minecraft-network:
+        ipv4_address: 172.24.0.3
+    labels:
+      - lazymc.enabled=true
+      - lazymc.group=mc
+      - lazymc.server.address=mc-transfer:25565
+      - lazymc.join.methods=transfer,kick
+      - lazymc.join.transfer.keep_alive_interval=5
+      - lazymc.time.minimum_online_time=30
+      - lazymc.time.sleep_after=5
+    tty: true
+    stdin_open: true
+    restart: no
+    environment:
+      EULA: "TRUE"
+      ONLINE_MODE: "FALSE"
+      VERSION: "1.21.1"
+      CUSTOM_SERVER_PROPERTIES: |
+        accepts-transfers=true
+    volumes:
+      - data:/data
+
+  mc-client-transfer:
+    container_name: mc-client-transfer
+    restart: no
+    environment:
+      SERVER_IP: 172.24.0.2
+      SERVER_PORT: 25565
+      USERNAME: "test-bot"
+    networks:
+      minecraft-network:
+        ipv4_address: 172.24.0.4
+    build: ../../bot/
+
+volumes:
+  data:

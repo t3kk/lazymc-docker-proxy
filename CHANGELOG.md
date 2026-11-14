@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `lazymc` is now built from the bundled `lazymc/` directory, which adds the `transfer` join method and the `{last_online}` MOTD placeholder
+- Labels `lazymc.join.transfer.timeout`, `lazymc.join.transfer.keep_alive_interval` and `lazymc.join.transfer.address`
+- Warning on start when the transfer join method is used and the server does not have `accepts-transfers=true`
+
+### Removed
+
+- Support for Minecraft servers older than 1.20.3 (the bundled legacy `lazymc` 0.2.10)
+
 ## [2.7.5] - 2026-06-20
 
 ### Updated

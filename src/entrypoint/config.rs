@@ -1,24 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env::var;
-use std::fs::File;
+use std::fs::{read_to_string, File};
 use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::process::{exit, Command};
-use version_compare::Version;
 
 use crate::{docker, health};
 
 const DEFAULT_PORT: i32 = 25565;
 
-/// lazymc dropped support minecraft servers with version less than 1.20.3
-fn is_legacy(version: Option<String>) -> bool {
-    if version.is_none() {
-        return false;
-    }
-
-    Version::from(version.unwrap().as_ref()) < Version::from("1.20.3")
+/// Whether the given server.properties content has transfers enabled
+fn accepts_transfers(properties: &str) -> bool {
+    properties.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "accepts-transfers" && value.trim() == "true")
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,6 +57,7 @@ struct JoinSection {
     hold: JoinHoldSection,
     forward: JoinForwardSection,
     lobby: JoinLobbySection,
+    transfer: JoinTransferSection,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -83,6 +82,13 @@ struct JoinLobbySection {
     timeout: Option<i32>,
     message: Option<String>,
     ready_sound: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct JoinTransferSection {
+    timeout: Option<i32>,
+    keep_alive_interval: Option<i32>,
+    address: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +169,28 @@ impl Config {
         let mut file = File::create(path).unwrap();
         file.write_all(toml.as_ref()).unwrap();
         debug!(target: "lazymc-docker-proxy::entrypoint::config", "`generated`: {}\n\n{}", path.display(), toml);
+    }
+
+    /// Warn if the transfer join method is used, but the server does not accept transfers
+    fn warn_if_transfers_not_accepted(&self) {
+        let uses_transfer = self
+            .join
+            .methods
+            .as_ref()
+            .is_some_and(|methods| methods.iter().any(|m| m.trim() == "transfer"));
+        if !uses_transfer {
+            return;
+        }
+
+        // The file does not exist until the server has started once, nothing to check then
+        let directory = self.server.directory.clone().unwrap_or_default();
+        let Ok(properties) = read_to_string(Path::new(&directory).join("server.properties")) else {
+            return;
+        };
+
+        if !accepts_transfers(&properties) {
+            warn!(target: "lazymc-docker-proxy::entrypoint::config", "The transfer join method is enabled for group {}, but accepts-transfers=true is not set in its server.properties. Clients will be refused after being transferred.", self.group);
+        }
     }
 
     /// Create a new configuration from container labels
@@ -265,6 +293,16 @@ impl Config {
             ready_sound: labels.get("lazymc.join.lobby.sound").cloned(),
         };
 
+        let join_transfer_section: JoinTransferSection = JoinTransferSection {
+            timeout: labels
+                .get("lazymc.join.transfer.timeout")
+                .and_then(|x| x.parse().ok()),
+            keep_alive_interval: labels
+                .get("lazymc.join.transfer.keep_alive_interval")
+                .and_then(|x| x.parse().ok()),
+            address: labels.get("lazymc.join.transfer.address").cloned(),
+        };
+
         let join_section: JoinSection = JoinSection {
             methods: labels
                 .get("lazymc.join.methods")
@@ -277,6 +315,7 @@ impl Config {
             hold: join_hold_section.clone(),
             forward: join_forward_section.clone(),
             lobby: join_lobby_section.clone(),
+            transfer: join_transfer_section.clone(),
         };
 
         let public_section: PublicSection = PublicSection {
@@ -310,22 +349,13 @@ impl Config {
         };
 
         let config_section: ConfigSection = ConfigSection {
-            version: match is_legacy(labels.get("lazymc.public.version").cloned()) {
-                true => var("LAZYMC_LEGACY_VERSION")
-                    .unwrap_or_else(|err| {
-                        error!(target: "lazymc-docker-proxy::entrypoint::config", "LAZYMC_LEGACY_VERSION is not set: {}", err);
-                        health::unhealthy();
-                        exit(1);
-                    })
-                    .into(),
-                false => var("LAZYMC_VERSION")
-                    .unwrap_or_else(|err| {
-                        error!(target: "lazymc-docker-proxy::entrypoint::config", "LAZYMC_VERSION is not set: {}", err);
-                        health::unhealthy();
-                        exit(1);
-                    })
-                    .into(),
-            },
+            version: var("LAZYMC_VERSION")
+                .unwrap_or_else(|err| {
+                    error!(target: "lazymc-docker-proxy::entrypoint::config", "LAZYMC_VERSION is not set: {}", err);
+                    health::unhealthy();
+                    exit(1);
+                })
+                .into(),
         };
 
         let config: Config = Config {
@@ -337,10 +367,7 @@ impl Config {
             lockout: lockout_section,
             advanced: advanced_section,
             config: config_section,
-            start_command: match is_legacy(labels.get("lazymc.public.version").cloned()) {
-                true => "lazymc-legacy".to_string(),
-                false => "lazymc".to_string(),
-            },
+            start_command: "lazymc".to_string(),
             config_file: format!(
                 "lazymc.{}.toml",
                 labels.get("lazymc.group").unwrap().clone()
@@ -348,6 +375,8 @@ impl Config {
             group: labels.get("lazymc.group").unwrap().clone(),
             resolved_ip,
         };
+
+        config.warn_if_transfers_not_accepted();
 
         // Generate the lazymc config file
         config.create_file();
@@ -397,6 +426,18 @@ impl Config {
         }
         if let Ok(value) = var("LAZYMC_JOIN_LOBBY_READY_SOUND") {
             labels.insert("lazymc.join.lobby.ready_sound".to_string(), value);
+        }
+        if let Ok(value) = var("LAZYMC_JOIN_TRANSFER_TIMEOUT") {
+            labels.insert("lazymc.join.transfer.timeout".to_string(), value);
+        }
+        if let Ok(value) = var("LAZYMC_JOIN_TRANSFER_KEEP_ALIVE_INTERVAL") {
+            labels.insert(
+                "lazymc.join.transfer.keep_alive_interval".to_string(),
+                value,
+            );
+        }
+        if let Ok(value) = var("LAZYMC_JOIN_TRANSFER_ADDRESS") {
+            labels.insert("lazymc.join.transfer.address".to_string(), value);
         }
         if let Ok(value) = var("LAZYMC_LOCKOUT_ENABLED") {
             labels.insert("lazymc.lockout.enabled".to_string(), value);
@@ -463,5 +504,19 @@ impl Config {
         }
 
         Config::from_container_labels(labels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts_transfers;
+
+    #[test]
+    fn detects_accepts_transfers() {
+        assert!(accepts_transfers("motd=hi\naccepts-transfers=true\n"));
+        assert!(accepts_transfers("accepts-transfers = true\r\n"));
+        assert!(!accepts_transfers("accepts-transfers=false\n"));
+        assert!(!accepts_transfers("#accepts-transfers=true\nmotd=hi\n"));
+        assert!(!accepts_transfers(""));
     }
 }
