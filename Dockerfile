@@ -2,7 +2,7 @@
 ARG LAZYMC_VERSION=0.2.11
 
 # set up rust
-FROM --platform=$BUILDPLATFORM rust:1.92-slim AS rust-setup
+FROM --platform=$BUILDPLATFORM rust:1.100-slim AS rust-setup
 ARG TARGETARCH
 RUN <<EOF
   echo Running build for $TARGETARCH
